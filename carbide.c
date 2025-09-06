@@ -75,6 +75,15 @@ static void dief(const char *fmt, const char *a) {
 	exit(1);
 }
 
+static void dief_rc(int rc, const char *cmd) {
+	char msg[256];
+	if (!cmd || !*cmd)
+		snprintf(msg, sizeof(msg), "default command failed (rc=%d)", rc);
+	else
+		snprintf(msg, sizeof(msg), "command '%s' failed (rc=%d)", cmd, rc);
+	dief("%s", msg);
+}
+
 static void color_fprintf_tag(FILE *f, const char *tag, const char *color) {
 	int use_color = (f == stderr) ? term_color_enabled_stderr() : term_color_enabled_stdout();
 	if (use_color) {
@@ -1658,6 +1667,8 @@ int main(int argc, char **argv) {
 	entry(ctx);
 
 	int rc = cb_dispatch(ctx);
+	if (rc != 0)
+		dief_rc(rc, ctx->args.cmd);
 
 	dylib_close(&lib);
 	cb_finish(ctx);
