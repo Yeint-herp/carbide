@@ -219,6 +219,9 @@ CB_API void cb_require_min_version(int M, int m, int p) {
 }
 
 CB_API void cb_log_verbose(const char *fmt, ...) {
+	if (!cb_is_verbose())
+		return;
+
 	color_fprintf_tag(stderr, "VERBOSE", FG_YELLOW);
 	va_list ap;
 	va_start(ap, fmt);
