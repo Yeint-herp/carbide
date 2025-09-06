@@ -47,7 +47,7 @@ extern "C" {
 
 #define CB_API_VERSION_MAJOR 2
 #define CB_API_VERSION_MINOR 1
-#define CB_API_VERSION_PATCH 1
+#define CB_API_VERSION_PATCH 2
 
 CB_API void cb_require_min_version(int major, int minor, int patch);
 

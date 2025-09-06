@@ -384,7 +384,7 @@ CB_API const char *cb_rel_to_workspace(const char *abs) {
 CB_API const char *cg_abspath(const char *p) {
 	if (!p || !*p) {
 #if defined(_WIN32)
-		DWORD n = GetCurrentDirectoryA(0, NULL);
+		DWORD n = GetCurrentDirectoryA(0, CB_NULL);
 		char *tmp = scratch();
 		if (n == 0 || n >= PATH_MAX) {
 			tmp[0] = 0;
@@ -1555,6 +1555,207 @@ static void hex64(uint64_t v, char out[17]) {
 	out[16] = 0;
 }
 
+static void dirname_into(const char *path, char *out, size_t outsz) {
+	if (!path || !*path) {
+		if (outsz)
+			out[0] = 0;
+		return;
+	}
+	size_t n = strlen(path);
+	size_t i = n;
+	while (i > 0 && !is_sep(path[i - 1]))
+		i--;
+	if (i == 0) {
+		strncpy(out, ".", outsz);
+		out[outsz ? outsz - 1 : 0] = 0;
+		return;
+	}
+	if (i >= outsz)
+		i = outsz ? outsz - 1 : 0;
+	memcpy(out, path, i);
+	out[i] = 0;
+}
+
+static int visited_has(cb_strlist *v, const char *pnorm) {
+	for (size_t i = 0; i < v->len; ++i)
+		if (strcmp(v->data[i], pnorm) == 0)
+			return 1;
+	return 0;
+}
+
+static void fp_add_file_and_includes(const char *file_path, uint64_t *h, cb_strlist *visited) {
+	if (!file_path || !*file_path)
+		return;
+
+	const char *normp = cb_norm(file_path);
+	if (!*normp)
+		return;
+	if (visited_has(visited, normp))
+		return;
+	cb_strlist_push(visited, normp);
+
+	*h = hash_file(normp, *h);
+
+	FILE *f = fopen(normp, "rb");
+	if (!f)
+		return;
+
+	char *buf = CB_NULL;
+	size_t cap = 0, len = 0;
+	char tmp[8192];
+	size_t r;
+	while ((r = fread(tmp, 1, sizeof(tmp), f)) > 0) {
+		if (len + r + 1 > cap) {
+			size_t newcap = cap ? cap * 2 : 16384;
+			while (newcap < len + r + 1)
+				newcap *= 2;
+			char *nb = (char *)realloc(buf, newcap);
+			if (!nb) {
+				free(buf);
+				fclose(f);
+				die("oom");
+			}
+			buf = nb;
+			cap = newcap;
+		}
+		memcpy(buf + len, tmp, r);
+		len += r;
+	}
+	fclose(f);
+	if (!buf)
+		return;
+	buf[len] = 0;
+
+	int in_sl_comment = 0;
+	int in_ml_comment = 0;
+	int in_string = 0;
+	int in_char = 0;
+	int bol = 1;
+
+	char incdir[PATH_MAX];
+	dirname_into(normp, incdir, sizeof(incdir));
+
+	for (size_t i = 0; i < len;) {
+		char c = buf[i];
+
+		if (c == '\n') {
+			bol = 1;
+			in_sl_comment = 0;
+			i++;
+			continue;
+		}
+		if (in_sl_comment) {
+			i++;
+			continue;
+		}
+		if (in_ml_comment) {
+			if (c == '*' && i + 1 < len && buf[i + 1] == '/') {
+				in_ml_comment = 0;
+				i += 2;
+			} else
+				i++;
+			continue;
+		}
+		if (in_string) {
+			if (c == '\\' && i + 1 < len) {
+				i += 2;
+				continue;
+			}
+			if (c == '"') {
+				in_string = 0;
+				i++;
+				continue;
+			}
+			i++;
+			continue;
+		}
+		if (in_char) {
+			if (c == '\\' && i + 1 < len) {
+				i += 2;
+				continue;
+			}
+			if (c == '\'') {
+				in_char = 0;
+				i++;
+				continue;
+			}
+			i++;
+			continue;
+		}
+
+		if (c == '/' && i + 1 < len && buf[i + 1] == '/') {
+			in_sl_comment = 1;
+			i += 2;
+			continue;
+		}
+		if (c == '/' && i + 1 < len && buf[i + 1] == '*') {
+			in_ml_comment = 1;
+			i += 2;
+			continue;
+		}
+		if (c == '"') {
+			in_string = 1;
+			i++;
+			continue;
+		}
+		if (c == '\'') {
+			in_char = 1;
+			i++;
+			continue;
+		}
+
+		if (bol && (c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v')) {
+			i++;
+			continue;
+		}
+
+		if (bol && c == '#') {
+			size_t j = i + 1;
+			while (j < len && (buf[j] == ' ' || buf[j] == '\t'))
+				j++;
+			const char kw[] = "include";
+			size_t k = 0;
+			while (j < len && k < sizeof(kw) - 1 && buf[j] == kw[k]) {
+				j++;
+				k++;
+			}
+			if (k == sizeof(kw) - 1) {
+				while (j < len && (buf[j] == ' ' || buf[j] == '\t'))
+					j++;
+				if (j < len && buf[j] == '"') {
+					j++;
+					size_t start = j;
+					while (j < len && buf[j] != '"')
+						j++;
+					if (j < len && buf[j] == '"') {
+						size_t L = j - start;
+						if (L > 0 && L < PATH_MAX - 1) {
+							char rel[PATH_MAX];
+							memcpy(rel, buf + start, L);
+							rel[L] = 0;
+
+							const char *joined = cb_join(incdir, rel);
+							const char *norm_inc = cb_norm(joined);
+
+							*h = fnv1a64(norm_inc, strlen(norm_inc), *h);
+
+							fp_add_file_and_includes(norm_inc, h, visited);
+						}
+					}
+				}
+			}
+			bol = 0;
+			i++;
+			continue;
+		}
+
+		bol = 0;
+		i++;
+	}
+
+	free(buf);
+}
+
 static void compute_fp(const char *src, const compiler_t *cc, char out[33]) {
 	uint64_t h = 0;
 
@@ -1578,6 +1779,10 @@ static void compute_fp(const char *src, const compiler_t *cc, char out[33]) {
 	h = fnv1a64("32", 2, h);
 #endif
 	h = hash_file(src, h);
+
+	cb_strlist visited; cb_strlist_init(&visited);
+	fp_add_file_and_includes(src, &h, &visited);
+	cb_strlist_free(&visited);
 
 	uint64_t h2 = hash_file(src, h ^ 0x9e3779b97f4a7c15ULL);
 
