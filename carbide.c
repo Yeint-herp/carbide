@@ -381,6 +381,62 @@ CB_API const char *cb_rel_to_workspace(const char *abs) {
 	return abs;
 }
 
+CB_API const char *cg_abspath(const char *p) {
+	if (!p || !*p) {
+#if defined(_WIN32)
+		DWORD n = GetCurrentDirectoryA(0, NULL);
+		char *tmp = scratch();
+		if (n == 0 || n >= PATH_MAX) {
+			tmp[0] = 0;
+			return tmp;
+		}
+		GetCurrentDirectoryA(PATH_MAX, tmp);
+		return cb_norm(tmp);
+#else
+		char *tmp = scratch();
+		if (!getcwd(tmp, PATH_MAX)) {
+			tmp[0] = 0;
+			return tmp;
+		}
+		return cb_norm(tmp);
+#endif
+	}
+
+#if defined(_WIN32)
+	char buf[PATH_MAX];
+	DWORD n = GetFullPathNameA(p, PATH_MAX, buf, CB_NULL);
+	if (n == 0 || n >= PATH_MAX) {
+		char cwd[PATH_MAX] = {0};
+		GetCurrentDirectoryA(PATH_MAX, cwd);
+		const char *j = cb_join(cwd, p);
+		return cb_norm(j);
+	}
+	char *out = scratch();
+	strncpy(out, buf, PATH_MAX);
+	out[PATH_MAX - 1] = 0;
+	return cb_norm(out);
+
+#else
+	{
+		char *rp = realpath(p, CB_NULL);
+		if (rp) {
+			char *out = scratch();
+			strncpy(out, rp, PATH_MAX);
+			out[PATH_MAX - 1] = 0;
+			free(rp);
+			return cb_norm(out);
+		}
+	}
+
+	char cwd[PATH_MAX];
+	if (!getcwd(cwd, sizeof(cwd))) {
+		return cb_norm(p);
+	}
+	const char *j = (prefix_len(p) > 0) ? p : cb_join(cwd, p);
+	return cb_norm(j);
+#endif
+}
+
 CB_API bool cb_file_exists(const char *path) {
 #if defined(_WIN32)
 	DWORD attrs = GetFileAttributesA(path);

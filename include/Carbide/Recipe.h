@@ -47,7 +47,7 @@ extern "C" {
 
 #define CB_API_VERSION_MAJOR 2
 #define CB_API_VERSION_MINOR 1
-#define CB_API_VERSION_PATCH 0
+#define CB_API_VERSION_PATCH 1
 
 CB_API void cb_require_min_version(int major, int minor, int patch);
 
@@ -105,6 +105,7 @@ CB_API void cb_strlist_push(cb_strlist *l, const char *s);
 CB_API const char *cb_norm(const char *p);
 CB_API const char *cb_join(const char *a, const char *b);
 CB_API const char *cb_rel_to_workspace(const char *abs);
+CB_API const char *cg_abspath(const char *p);
 
 CB_API bool cb_file_exists(const char *path);
 CB_API bool cb_is_dir(const char *path);
