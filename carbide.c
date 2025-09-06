@@ -479,6 +479,14 @@ CB_API void cb_strlist_push(cb_strlist *l, const char *s) {
 	l->data[l->len++] = dup;
 }
 
+static bool ends_with(const char *s, const char *suf) {
+	if (!suf || !*suf)
+		return 1;
+
+	size_t ls = strlen(s), lu = strlen(suf);
+	return (ls >= lu) && (strcmp(s + (ls - lu), suf) == 0);
+}
+
 CB_API void cb_glob(const char *pattern, cb_strlist *out) {
 	if (!pattern || !*pattern || !out)
 		return;
@@ -529,49 +537,69 @@ static void rglob_impl(const char *root, const char *suffix, cb_strlist *out) {
 	snprintf(pattern, sizeof(pattern), "%s\\*", root);
 	WIN32_FIND_DATAA f;
 	HANDLE h = FindFirstFileA(pattern, &f);
-	if (h == INVALID_HANDLE_VALUE)
+	if (h == INVALID_HANDLE_VALUE) {
 		return;
+	}
 	do {
 		const char *name = f.cFileName;
 		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
 			continue;
-		const char *full = cb_join(root, name);
+		char full[PATH_MAX];
+		snprintf(full, sizeof(full), "%s\\%s", root, name);
 		if (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
 			rglob_impl(full, suffix, out);
 		} else {
-			if (!suffix ||
-				(strlen(full) >= strlen(suffix) && strcmp(full + strlen(full) - strlen(suffix), suffix) == 0))
+			if (ends_with(full, suffix)) {
 				cb_strlist_push(out, full);
+			}
 		}
 	} while (FindNextFileA(h, &f));
 	FindClose(h);
 #else
 	DIR *d = opendir(root);
-	if (!d)
+	if (!d) {
 		return;
+	}
 	struct dirent *ent;
 	while ((ent = readdir(d))) {
-		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+		const char *name = ent->d_name;
+		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
 			continue;
-		const char *full = cb_join(root, ent->d_name);
+
+		char full[PATH_MAX];
+		size_t n = snprintf(full, sizeof(full), "%s/%s", root, name);
+		if (n >= sizeof(full))
+			continue;
+
 		struct stat st;
-		if (stat(full, &st) != 0)
+		if (lstat(full, &st) != 0) {
 			continue;
-		if (S_ISDIR(st.st_mode))
+		}
+		if (S_ISDIR(st.st_mode)) {
 			rglob_impl(full, suffix, out);
-		else if (!suffix ||
-				 (strlen(full) >= strlen(suffix) && strcmp(full + strlen(full) - strlen(suffix), suffix) == 0))
-			cb_strlist_push(out, full);
+		} else if (S_ISREG(st.st_mode)) {
+			if (ends_with(full, suffix)) {
+				cb_strlist_push(out, full);
+			}
+		}
 	}
 	closedir(d);
 #endif
 }
+
 CB_API void cb_rglob(const char *root_dir, const char *suffix, cb_strlist *out) {
 	if (!root_dir || !*root_dir || !out)
 		return;
-	if (!cb_is_dir(root_dir))
+
+	char root[PATH_MAX];
+	const char *norm = cb_norm(root_dir);
+	strncpy(root, norm, sizeof(root));
+	root[sizeof(root) - 1] = '\0';
+
+	if (!cb_is_dir(root)) {
 		return;
-	rglob_impl(cb_norm(root_dir), suffix, out);
+	}
+	rglob_impl(root, suffix, out);
 }
 
 static int64_t file_mtime(const char *p) {
