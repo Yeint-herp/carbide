@@ -55,9 +55,6 @@ static char *g_default_help = CB_NULL;
 
 static inline int term_color_enabled_stderr(void) { return g_ctx_singleton && g_ctx_singleton->term.use_color_stderr; }
 static inline int term_color_enabled_stdout(void) { return g_ctx_singleton && g_ctx_singleton->term.use_color_stdout; }
-static inline const char *ansi(const char *code) {
-	return (term_color_enabled_stderr() || term_color_enabled_stdout()) ? code : "";
-}
 
 static void die(const char *msg) {
 	if (term_color_enabled_stderr())
