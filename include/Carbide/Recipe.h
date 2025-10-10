@@ -96,7 +96,24 @@ typedef struct {
 	size_t len, cap;
 } cb_strlist;
 
+typedef enum { CB_OWN_PARENT = 0, CB_OWN_CHILD = 1, CB_OWN_SHARED = 2 } cb_share_owner;
+
 CB_API cb_context *cb_ctx(void);
+
+CB_API int cb_subrecipe_push(const char *dir);
+CB_API int cb_subrecipe_run(const char *cmd, const char *const *argv, size_t argc);
+CB_API void cb_subrecipe_pop(void);
+
+typedef void (*carbide_recipe_receiver_fn)(void *);
+typedef void (*carbide_recipe_init_fn)(cb_context *);
+
+typedef void (*cb_share_dtor)(void *);
+
+CB_API void cb_subrecipe_set_handoff(void *ptr, cb_share_owner owner, cb_share_dtor dtor);
+
+CB_API void cb_shared_adopt(void *ptr, cb_share_owner new_owner);
+CB_API void *cb_shared_current(void);
+CB_API void cb_shared_clear(void *ptr);
 
 CB_API void cb_strlist_init(cb_strlist *l);
 CB_API void cb_strlist_free(cb_strlist *l);

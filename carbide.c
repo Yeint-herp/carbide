@@ -26,6 +26,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdnoreturn.h>
 #include <string.h>
 #include <time.h>
 
@@ -44,6 +45,7 @@
 static cb_context *g_ctx_singleton = CB_NULL;
 static cb_cmd_handler_fn g_default_fn = CB_NULL;
 static char *g_default_help = CB_NULL;
+char cwd[PATH_MAX] = {0};
 
 #define SGR_RESET "\x1b[0m"
 #define SGR_BOLD "\x1b[1m"
@@ -52,11 +54,24 @@ static char *g_default_help = CB_NULL;
 #define FG_CYAN "\x1b[36m"
 #define FG_MAGENTA "\x1b[35m"
 #define FG_DIM "\x1b[2m"
+#define FG_BLUE "\x1b[34m"
+
+#if defined(_WIN32)
+static void set_env_kv(const char *k, const char *v) {
+	if (k && v)
+		_putenv_s(k, v);
+}
+#else
+static void set_env_kv(const char *k, const char *v) {
+	if (k && v)
+		setenv(k, v, 1);
+}
+#endif
 
 static inline int term_color_enabled_stderr(void) { return g_ctx_singleton && g_ctx_singleton->term.use_color_stderr; }
 static inline int term_color_enabled_stdout(void) { return g_ctx_singleton && g_ctx_singleton->term.use_color_stdout; }
 
-static void die(const char *msg) {
+noreturn static void die(const char *msg) {
 	if (term_color_enabled_stderr())
 		fprintf(stderr, "%s%s%s %s%s%s\n", FG_RED, "carbide:", SGR_RESET, SGR_BOLD, msg, SGR_RESET);
 	else
@@ -64,7 +79,7 @@ static void die(const char *msg) {
 	exit(1);
 }
 
-static void dief(const char *fmt, const char *a) {
+noreturn static void dief(const char *fmt, const char *a) {
 	if (term_color_enabled_stderr())
 		fprintf(stderr, "%s%s%s ", FG_RED, "carbide:", SGR_RESET);
 	fprintf(stderr, fmt, a);
@@ -72,7 +87,7 @@ static void dief(const char *fmt, const char *a) {
 	exit(1);
 }
 
-static void dief_rc(int rc, const char *cmd) {
+noreturn static void dief_rc(int rc, const char *cmd) {
 	char msg[256];
 	if (!cmd || !*cmd)
 		snprintf(msg, sizeof(msg), "default command failed (rc=%d)", rc);
@@ -88,6 +103,41 @@ static void color_fprintf_tag(FILE *f, const char *tag, const char *color) {
 	} else {
 		fprintf(f, "[%s] ", tag);
 	}
+}
+
+static char *sdup(const char *s) {
+	size_t n = strlen(s) + 1;
+	char *d = (char *)malloc(n);
+	if (!d)
+		die("oom");
+	memcpy(d, s, n);
+	return d;
+}
+
+static int is_env_assignment(const char *s, const char **out_k, const char **out_v) {
+	if (!s)
+		return 0;
+
+	const char *eq = strchr(s, '=');
+	if (!eq || eq == s)
+		return 0;
+
+	const char *k = s;
+	if (!(isalpha((unsigned char)*k) || *k == '_'))
+		return 0;
+
+	for (const char *p = k + 1; p < eq; ++p) {
+		if (!(isalnum((unsigned char)*p) || *p == '_'))
+			return 0;
+	}
+
+	if (out_k)
+		*out_k = k;
+
+	if (out_v)
+		*out_v = eq + 1;
+
+	return 1;
 }
 
 static int env_truthy(const char *v) {
@@ -137,6 +187,7 @@ static void init_terminal_caps(cb_term_caps *caps) {
 #endif
 	if (getenv("NO_COLOR")) {
 		caps->color_level = CB_TERM_COLOR_NONE;
+		return;
 	} else {
 		caps->color_level = detect_color_level_from_env();
 	}
@@ -236,6 +287,15 @@ CB_API void cb_log_info(const char *fmt, ...) {
 	fputc('\n', stderr);
 }
 
+static void cb_log_internal(const char *fmt, ...) {
+	color_fprintf_tag(stderr, "INTERNAL", FG_BLUE);
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc('\n', stderr);
+}
+
 CB_API void cb_log_warn(const char *fmt, ...) {
 	color_fprintf_tag(stderr, "WARN", FG_MAGENTA);
 	va_list ap;
@@ -256,7 +316,7 @@ CB_API void cb_log_error(const char *fmt, ...) {
 
 CB_API const char *cb_norm(const char *p) {
 	if (!p || !*p)
-		return "";
+		return sdup("");
 	char *out = scratch();
 
 	char tmp[PATH_MAX];
@@ -334,7 +394,7 @@ CB_API const char *cb_norm(const char *p) {
 		strcpy(out, ".");
 	if (out_len > pref && out[out_len - 1] == CB_PATH_SEP)
 		out[--out_len] = 0;
-	return out;
+	return sdup(out);
 }
 
 CB_API const char *cb_join(const char *a, const char *b) {
@@ -354,7 +414,7 @@ CB_API const char *cb_join(const char *a, const char *b) {
 	size_t alen = strlen(a), blen = strlen(b);
 	if (alen + 1 + blen + 1 >= PATH_MAX) {
 		buf[0] = 0;
-		return buf;
+		return sdup(buf);
 	}
 	memcpy(buf, a, alen);
 	size_t n = alen;
@@ -384,16 +444,14 @@ CB_API const char *cg_abspath(const char *p) {
 		DWORD n = GetCurrentDirectoryA(0, CB_NULL);
 		char *tmp = scratch();
 		if (n == 0 || n >= PATH_MAX) {
-			tmp[0] = 0;
-			return tmp;
+			return sdup("");
 		}
 		GetCurrentDirectoryA(PATH_MAX, tmp);
 		return cb_norm(tmp);
 #else
 		char *tmp = scratch();
 		if (!getcwd(tmp, PATH_MAX)) {
-			tmp[0] = 0;
-			return tmp;
+			return sdup("");
 		}
 		return cb_norm(tmp);
 #endif
@@ -406,22 +464,19 @@ CB_API const char *cg_abspath(const char *p) {
 		char cwd[PATH_MAX] = {0};
 		GetCurrentDirectoryA(PATH_MAX, cwd);
 		const char *j = cb_join(cwd, p);
-		return cb_norm(j);
+		const char *norm = cb_norm(j);
+		free((void *)j);
+		return norm;
 	}
-	char *out = scratch();
-	strncpy(out, buf, PATH_MAX);
-	out[PATH_MAX - 1] = 0;
-	return cb_norm(out);
+	return cb_norm(buf);
 
 #else
 	{
 		char *rp = realpath(p, CB_NULL);
 		if (rp) {
-			char *out = scratch();
-			strncpy(out, rp, PATH_MAX);
-			out[PATH_MAX - 1] = 0;
+			const char *norm = cb_norm(rp);
 			free(rp);
-			return cb_norm(out);
+			return norm;
 		}
 	}
 
@@ -429,8 +484,14 @@ CB_API const char *cg_abspath(const char *p) {
 	if (!getcwd(cwd, sizeof(cwd))) {
 		return cb_norm(p);
 	}
-	const char *j = (prefix_len(p) > 0) ? p : cb_join(cwd, p);
-	return cb_norm(j);
+	if (prefix_len(p) > 0) {
+		return cb_norm(p);
+	} else {
+		const char *j = cb_join(cwd, p);
+		const char *norm = cb_norm(j);
+		free((void *)j);
+		return norm;
+	}
 #endif
 }
 
@@ -1297,15 +1358,6 @@ CB_API const char *cb_workspace_root(void) { return g_ctx_singleton ? g_ctx_sing
 CB_API const char *cb_out_root(void) { return g_ctx_singleton ? g_ctx_singleton->out_root : ""; }
 CB_API const char *cb_tool_root(void) { return g_ctx_singleton ? g_ctx_singleton->tool_root : ""; }
 
-static char *sdup(const char *s) {
-	size_t n = strlen(s) + 1;
-	char *d = (char *)malloc(n);
-	if (!d)
-		die("oom");
-	memcpy(d, s, n);
-	return d;
-}
-
 CB_API cb_context *cb_init(int argc, char **argv, cb_args *out_args) {
 	cb_context *ctx = (cb_context *)calloc(1, sizeof(*ctx));
 	if (!ctx)
@@ -1325,7 +1377,7 @@ CB_API cb_context *cb_init(int argc, char **argv, cb_args *out_args) {
 	const char *out_dir_rel = ".carbide/out";
 	cb_mkdir_p(".carbide");
 	cb_mkdir_p(out_dir_rel);
-	ctx->out_root = sdup(cb_norm(out_dir_rel));
+	ctx->out_root = sdup(cg_abspath(out_dir_rel));
 	ctx->tool_root =
 #if defined(_WIN32)
 		sdup("C:\\Program Files\\Carbide");
@@ -1352,8 +1404,20 @@ CB_API cb_context *cb_init(int argc, char **argv, cb_args *out_args) {
 				break;
 			}
 			cb_log_warn("unknown flag '%s' (ignored)", s);
-		} else
+		} else {
+			const char *k = CB_NULL, *v = CB_NULL;
+			if (is_env_assignment(s, &k, &v)) {
+				char keybuf[256] = {0};
+				size_t klen = (size_t)(strchr(s, '=') - s);
+				if (klen >= sizeof(keybuf))
+					klen = sizeof(keybuf) - 1;
+				memcpy(keybuf, k, klen);
+				keybuf[klen] = 0;
+				set_env_kv(keybuf, v);
+				continue;
+			}
 			break;
+		}
 	}
 	if (i < argc) {
 		A.cmd = argv[i++];
@@ -1434,8 +1498,6 @@ static const char *shared_ext(void) { return ".so"; }
 	#endif
 #endif
 
-typedef void (*carbide_recipe_init_fn)(cb_context *);
-
 typedef enum { CC_NONE, CC_MSVC, CC_CLANG_CL, CC_CLANG, CC_GCC } cc_kind;
 typedef struct {
 	cc_kind kind;
@@ -1465,28 +1527,37 @@ static int on_path(const char *exe, char *buf, size_t bufsz) {
 #endif
 }
 
+static compiler_t g_compiler_cache = {CC_NONE, CB_NULL};
+
 static compiler_t discover_compiler(void) {
+	if (g_compiler_cache.path != CB_NULL)
+		return g_compiler_cache;
+
 	compiler_t c = {CC_NONE, CB_NULL};
 #if defined(_WIN32)
 	char buf[PATH_MAX];
 	if (on_path("cl.exe", buf, sizeof(buf))) {
 		c.kind = CC_MSVC;
 		c.path = sdup(buf);
+		g_compiler_cache = c;
 		return c;
 	}
 	if (on_path("clang-cl.exe", buf, sizeof(buf))) {
 		c.kind = CC_CLANG_CL;
 		c.path = sdup(buf);
+		g_compiler_cache = c;
 		return c;
 	}
 	if (on_path("clang.exe", buf, sizeof(buf))) {
 		c.kind = CC_CLANG;
 		c.path = sdup(buf);
+		g_compiler_cache = c;
 		return c;
 	}
 	if (on_path("gcc.exe", buf, sizeof(buf))) {
 		c.kind = CC_GCC;
 		c.path = sdup(buf);
+		g_compiler_cache = c;
 		return c;
 	}
 	die("no C compiler found (install MSVC/Clang/GCC or set PATH)");
@@ -1495,16 +1566,19 @@ static compiler_t discover_compiler(void) {
 	if (on_path("cc", buf, sizeof(buf))) {
 		c.kind = CC_GCC;
 		c.path = sdup(buf);
+		g_compiler_cache = c;
 		return c;
 	}
 	if (on_path("clang", buf, sizeof(buf))) {
 		c.kind = CC_CLANG;
 		c.path = sdup(buf);
+		g_compiler_cache = c;
 		return c;
 	}
 	if (on_path("gcc", buf, sizeof(buf))) {
 		c.kind = CC_GCC;
 		c.path = sdup(buf);
+		g_compiler_cache = c;
 		return c;
 	}
 	die("no C compiler found (install clang/gcc or set PATH)");
@@ -1512,12 +1586,165 @@ static compiler_t discover_compiler(void) {
 	return (compiler_t){};
 }
 
-static const char *stamp_path(void) { return cb_join(".carbide", "Carbidefile.stamp"); }
+typedef struct recipe_frame {
+	dylib_t lib;
+	handler_node *saved_handlers;
+	cb_cmd_handler_fn saved_default_fn;
+	char *saved_default_help;
+	char cwd_before[PATH_MAX];
+	char *so_path_owned;
+	const char *saved_ws;
+	const char *saved_out;
+	void *handoff_ptr;
+	void (*handoff_dtor)(void *);
+	int handoff_owner; /* 0=parent, 1=child, 2=shared */
+} recipe_frame;
 
-static const char *out_so_path(void) {
+static recipe_frame *g_recipe_stack = CB_NULL;
+static int g_recipe_sp = 0, g_recipe_cap = 0;
+
+static void push_frame(recipe_frame f) {
+	if (g_recipe_sp == g_recipe_cap) {
+		g_recipe_cap = g_recipe_cap ? g_recipe_cap * 2 : 4;
+		g_recipe_stack = (recipe_frame *)realloc(g_recipe_stack, (size_t)g_recipe_cap * sizeof(recipe_frame));
+		if (!g_recipe_stack)
+			die("oom");
+	}
+	g_recipe_stack[g_recipe_sp++] = f;
+}
+
+static recipe_frame pop_frame(void) {
+	if (g_recipe_sp <= 0)
+		die("recipe stack underflow");
+	return g_recipe_stack[--g_recipe_sp];
+}
+
+static void free_handlers_list(handler_node *h) {
+	while (h) {
+		handler_node *n = h->next;
+		free(h->name);
+		free(h->help);
+		free(h);
+		h = n;
+	}
+}
+
+static const char *out_so_path(const char *dir) {
 	char *b = scratch();
-	snprintf(b, PATH_MAX, "%s%s", cb_join(".carbide", "Carbidefile"), shared_ext());
-	return b;
+	const char *carbide_dir = cb_join(dir, ".carbide");
+	const char *bin = cb_join(carbide_dir, "Carbidefile");
+	snprintf(b, PATH_MAX, "%s%s", bin, shared_ext());
+	free((void *)carbide_dir);
+	free((void *)bin);
+	return sdup(b);
+}
+
+static void handlers_swap_for_subrecipe(void) {
+	recipe_frame f = {0};
+	f.saved_handlers = g_handlers;
+	g_handlers = CB_NULL;
+	f.saved_default_fn = g_default_fn;
+	g_default_fn = CB_NULL;
+	f.saved_default_help = g_default_help;
+	g_default_help = CB_NULL;
+#if defined(_WIN32)
+	GetCurrentDirectoryA((DWORD)sizeof(f.cwd_before), f.cwd_before);
+#else
+	getcwd(f.cwd_before, sizeof(f.cwd_before));
+#endif
+	f.saved_ws = cb_ctx()->workspace_root;
+	f.saved_out = cb_ctx()->out_root;
+	push_frame(f);
+}
+
+static void handlers_restore_from_frame(recipe_frame *f) {
+	free_handlers_list(g_handlers);
+	free(g_default_help);
+
+	g_handlers = f->saved_handlers;
+	g_default_fn = f->saved_default_fn;
+	g_default_help = f->saved_default_help;
+
+#if defined(_WIN32)
+	SetCurrentDirectoryA(f->cwd_before);
+#else
+	chdir(f->cwd_before);
+#endif
+	free((void *)cb_ctx()->workspace_root);
+	free((void *)cb_ctx()->out_root);
+	cb_ctx()->workspace_root = f->saved_ws;
+	cb_ctx()->out_root = f->saved_out;
+}
+
+CB_API int cb_subrecipe_run(const char *cmd, const char *const *argv, size_t argc) {
+	cb_context *ctx = cb_ctx();
+	cb_args saved = ctx->args;
+
+	cb_args tmp = saved;
+	tmp.cmd = cmd;
+	tmp.cmd_argv = argv;
+	tmp.cmd_argc = argc;
+	ctx->args = tmp;
+
+	int rc = cb_dispatch(ctx);
+
+	ctx->args = saved;
+	return rc;
+}
+
+CB_API void cb_subrecipe_pop(void) {
+	recipe_frame f = pop_frame();
+	if (f.handoff_ptr && f.handoff_owner == CB_OWN_CHILD && f.handoff_dtor) {
+		cb_log_warn("child still owned shared memory on pop; freeing in parent");
+		f.handoff_dtor(f.handoff_ptr);
+	}
+	dylib_close(&f.lib);
+	free(f.so_path_owned);
+	handlers_restore_from_frame(&f);
+}
+
+CB_API void cb_subrecipe_set_handoff(void *ptr, cb_share_owner owner, cb_share_dtor dtor) {
+	if (g_recipe_sp == 0) {
+		recipe_frame f = {0};
+		push_frame(f);
+	}
+	recipe_frame *f = &g_recipe_stack[g_recipe_sp - 1];
+	f->handoff_ptr = ptr;
+	f->handoff_owner = (int)owner;
+	f->handoff_dtor = dtor;
+}
+
+CB_API void cb_shared_adopt(void *ptr, cb_share_owner new_owner) {
+	if (g_recipe_sp <= 0)
+		return;
+	recipe_frame *f = &g_recipe_stack[g_recipe_sp - 1];
+	if (f->handoff_ptr == ptr)
+		f->handoff_owner = (int)new_owner;
+}
+
+CB_API void *cb_shared_current(void) {
+	if (g_recipe_sp <= 0)
+		return CB_NULL;
+	recipe_frame *f = &g_recipe_stack[g_recipe_sp - 1];
+	return f->handoff_ptr;
+}
+
+CB_API void cb_shared_clear(void *ptr) {
+	if (g_recipe_sp <= 0)
+		return;
+	recipe_frame *f = &g_recipe_stack[g_recipe_sp - 1];
+	if (f->handoff_ptr == ptr) {
+		f->handoff_ptr = CB_NULL;
+		f->handoff_dtor = CB_NULL;
+		f->handoff_owner = CB_OWN_PARENT;
+	}
+}
+
+static const char *stamp_path(const char *dir) {
+	const char *a = cb_join(dir, ".carbide");
+	const char *p = cb_join(a, "Carbidefile.stamp");
+	free((void *)a);
+	return p;
 }
 
 static uint64_t fnv1a64(const void *buf, size_t n, uint64_t seed) {
@@ -1777,7 +2004,8 @@ static void compute_fp(const char *src, const compiler_t *cc, char out[33]) {
 #endif
 	h = hash_file(src, h);
 
-	cb_strlist visited; cb_strlist_init(&visited);
+	cb_strlist visited;
+	cb_strlist_init(&visited);
 	fp_add_file_and_includes(src, &h, &visited);
 	cb_strlist_free(&visited);
 
@@ -1789,11 +2017,16 @@ static void compute_fp(const char *src, const compiler_t *cc, char out[33]) {
 	snprintf(out, 33, "%s%s", a, b);
 }
 
-static void write_stamp(const char *cc_path, const char *fp) {
+static void write_stamp(const char *dir, const char *cc_path, const char *fp) {
 	char buf[1024];
 	snprintf(buf, sizeof(buf), "api=%d.%d.%d\ncc=%s\nfp=%s\n", CB_API_VERSION_MAJOR, CB_API_VERSION_MINOR,
 			 CB_API_VERSION_PATCH, cc_path ? cc_path : "", fp ? fp : "");
-	cb_write_text(stamp_path(), buf);
+	const char *sp = stamp_path(dir);
+	const char *carb = cb_join(dir, ".carbide");
+	cb_mkdir_p(carb);
+	cb_write_text(sp, buf);
+	free((void *)sp);
+	free((void *)carb);
 }
 
 static void copy_line_value(char *dst, size_t dstsz, const char *src_after_eq) {
@@ -1808,14 +2041,15 @@ static void copy_line_value(char *dst, size_t dstsz, const char *src_after_eq) {
 	dst[len] = '\0';
 }
 
-static int read_stamp(int *apiM, int *apim, int *apip, char *cc_path_out, size_t cc_sz, char *fp_out, size_t fp_sz) {
-	FILE *f = fopen(stamp_path(), "r");
+static int read_stamp(const char *dir, int *apiM, int *apim, int *apip, char *cc_path_out, size_t cc_sz, char *fp_out,
+					  size_t fp_sz) {
+	const char *sp = stamp_path(dir);
+	FILE *f = fopen(sp, "r");
+	free((void *)sp);
 	if (!f)
 		return 0;
-
 	char line[1024];
 	int got_api = 0, got_cc = 0, got_fp = 0;
-
 	while (fgets(line, sizeof(line), f)) {
 		if (!got_api && sscanf(line, "api=%d.%d.%d", apiM, apim, apip) == 3) {
 			got_api = 1;
@@ -1831,10 +2065,14 @@ static int read_stamp(int *apiM, int *apim, int *apip, char *cc_path_out, size_t
 	return (got_api && got_cc && got_fp);
 }
 
-static int compile_carbidefile(const compiler_t *cc, const char *src, const char *so_out) {
-	int exit_code = -1;
-	cb_cmd *cm = cb_cmd_new();
+static int compile_carbidefile(const char *dir, const compiler_t *cc, const char *src_rel, const char *so_out) {
+	const char *src = cb_join(dir, src_rel);
+	if (!cb_file_exists(src)) {
+		dief("could not find recipe file (%s)", src);
+	}
+	cb_mkdir_p(cb_join(dir, ".carbide"));
 
+	cb_cmd *cm = cb_cmd_new();
 #if defined(_WIN32)
 	if (cc->kind == CC_MSVC || cc->kind == CC_CLANG_CL) {
 		char oflag[PATH_MAX + 8];
@@ -1878,21 +2116,111 @@ static int compile_carbidefile(const compiler_t *cc, const char *src, const char
 	cb_cmd_push_arg(cm, so_out);
 	cb_cmd_push_arg(cm, src);
 #endif
+	int exit_code = -1;
 	int rc = cb_cmd_run(cm, &exit_code);
 	cb_cmd_free(cm);
 	if (rc != 0 || exit_code != 0) {
-		if (term_color_enabled_stderr()) {
+		if (term_color_enabled_stderr())
 			fprintf(stderr, "%s%s%s recipe compilation failed (rc=%d exit=%d)\n", FG_RED, "carbide:", SGR_RESET, rc,
 					exit_code);
-		} else {
+		else
 			fprintf(stderr, "carbide: recipe compilation failed (rc=%d exit=%d)\n", rc, exit_code);
-		}
 		return -1;
 	}
 	return 0;
 }
 
+CB_API int cb_subrecipe_push(const char *dir) {
+	if (!dir || !*dir)
+		return -1;
+
+	compiler_t cc = discover_compiler();
+
+	const char *so_out = out_so_path(dir);
+	char *so_owned = sdup(so_out);
+
+	const char *src = cb_join(dir, "Carbidefile.c");
+	int need_build = 0;
+	int64_t m_src = file_mtime(src);
+	int64_t m_so = file_mtime(so_out);
+	if (m_so == 0 || m_src > m_so)
+		need_build = 1;
+
+	char cur_fp[33] = {0};
+	compute_fp(src, &cc, cur_fp);
+	int apiM = 0, apim = 0, apip = 0;
+	char prev_cc[PATH_MAX] = {0};
+	char prev_fp[64] = {0};
+	int have_stamp = read_stamp(dir, &apiM, &apim, &apip, prev_cc, sizeof(prev_cc), prev_fp, sizeof(prev_fp));
+	if (!have_stamp) {
+		need_build = 1;
+	} else {
+		if (strcmp(prev_cc, cc.path ? cc.path : "") != 0)
+			need_build = 1;
+		if (apiM != CB_API_VERSION_MAJOR || apim != CB_API_VERSION_MINOR || apip != CB_API_VERSION_PATCH)
+			need_build = 1;
+		if (strcmp(prev_fp, cur_fp) != 0)
+			need_build = 1;
+	}
+	if (need_build) {
+		if (compile_carbidefile(dir, &cc, "Carbidefile.c", so_out) != 0) {
+			free(so_owned);
+			free(cc.path);
+			return -1;
+		}
+		write_stamp(dir, cc.path, cur_fp);
+	} else {
+		cb_log_internal("using cached Carbidefile (%s)", so_out);
+	}
+	free(cc.path);
+
+	handlers_swap_for_subrecipe();
+#if defined(_WIN32)
+	SetCurrentDirectoryA(dir);
+#else
+	chdir(dir);
+#endif
+	cb_ctx()->workspace_root = sdup(cb_norm(dir));
+	const char *sub_out = cb_join(dir, ".carbide/out");
+	cb_mkdir_p(cb_join(dir, ".carbide"));
+	cb_mkdir_p(sub_out);
+	cb_ctx()->out_root = sdup(cb_norm(sub_out));
+	cb_register_cmd("help", builtin_help, "List available commands");
+
+	dylib_t lib = dylib_open(so_out);
+	carbide_recipe_init_fn entry = (carbide_recipe_init_fn)dylib_symbol(&lib, "carbide_recipe_main");
+	if (!entry) {
+		dylib_close(&lib);
+		recipe_frame f = pop_frame();
+		handlers_restore_from_frame(&f);
+		free(so_owned);
+		return -1;
+	}
+
+	entry(cb_ctx());
+
+	{
+		recipe_frame *top = &g_recipe_stack[g_recipe_sp - 1];
+		if (top->handoff_ptr) {
+			carbide_recipe_receiver_fn recv = (carbide_recipe_receiver_fn)dylib_symbol(&lib, "carbide_recipe_receiver");
+			if (recv) {
+				recv(top->handoff_ptr);
+			} else {
+				cb_log_warn("child does not export carbide_recipe_receiver(void*); handoff skipped");
+			}
+		}
+	}
+
+	g_recipe_stack[g_recipe_sp - 1].lib = lib;
+	g_recipe_stack[g_recipe_sp - 1].so_path_owned = so_owned;
+
+	return 0;
+}
+
 int main(int argc, char **argv) {
+	if (getcwd(cwd, sizeof(cwd)) == CB_NULL)
+		die("getcwd() error!");
+
 	cb_args parsed;
 	cb_context *ctx = cb_init(argc, argv, &parsed);
 	(void)parsed;
@@ -1902,12 +2230,9 @@ int main(int argc, char **argv) {
 		dief("could not find recipe file (%s) in current directory", src);
 
 	compiler_t cc = discover_compiler();
-	if (term_color_enabled_stderr()) {
-		fprintf(stderr, "%s%s%s using compiler: %s\n", FG_CYAN, "carbide:", SGR_RESET, cc.path);
-	} else {
-		fprintf(stderr, "carbide: using compiler: %s\n", cc.path);
-	}
-	char *so_path = sdup(out_so_path());
+	cb_log_internal("using compiler: %s", cc.path);
+
+	char *so_path = sdup(out_so_path(cwd));
 
 	int need_build = 0;
 	int64_t m_src = file_mtime(src);
@@ -1922,7 +2247,7 @@ int main(int argc, char **argv) {
 	int apiM = 0, apim = 0, apip = 0;
 	char prev_cc[PATH_MAX] = {0};
 	char prev_fp[64] = {0};
-	int have_stamp = read_stamp(&apiM, &apim, &apip, prev_cc, sizeof(prev_cc), prev_fp, sizeof(prev_fp));
+	int have_stamp = read_stamp(cwd, &apiM, &apim, &apip, prev_cc, sizeof(prev_cc), prev_fp, sizeof(prev_fp));
 
 	if (!have_stamp)
 		need_build = 1;
@@ -1937,15 +2262,14 @@ int main(int argc, char **argv) {
 
 	if (need_build) {
 		cb_mkdir_p(".carbide");
-		if (compile_carbidefile(&cc, src, so_path) != 0) {
+		if (compile_carbidefile(cwd, &cc, src, so_path) != 0) {
 			cb_finish(ctx);
-			free(cc.path);
 			free(so_path);
 			return 1;
 		}
-		write_stamp(cc.path, cur_fp);
+		write_stamp(cwd, cc.path, cur_fp);
 	} else {
-		cb_log_info("using cached Carbidefile (%s)", so_path);
+		cb_log_internal("using cached Carbidefile (%s)", so_path);
 	}
 
 	dylib_t lib = dylib_open(so_path);

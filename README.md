@@ -8,7 +8,7 @@ No Node, no Python, no heavy frameworks, **just a C compiler**.
 
 ## Features
 
-- **Cross-platform**: Linux, Windows (currently untested), macOS
+- **Cross-platform**: Linux, Windows (currently broken), macOS
 - **Self-hosting**: this repo builds Carbide using Carbide
 - **Fast builds**: automatic fingerprinting and caching
 - **Batteries included**:
