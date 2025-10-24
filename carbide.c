@@ -1407,7 +1407,7 @@ CB_API cb_context *cb_init(int argc, char **argv, cb_args *out_args) {
 		} else {
 			const char *k = CB_NULL, *v = CB_NULL;
 			if (is_env_assignment(s, &k, &v)) {
-				char keybuf[256] = {0};
+				char keybuf[4096] = {0};
 				size_t klen = (size_t)(strchr(s, '=') - s);
 				if (klen >= sizeof(keybuf))
 					klen = sizeof(keybuf) - 1;
@@ -1421,8 +1421,27 @@ CB_API cb_context *cb_init(int argc, char **argv, cb_args *out_args) {
 	}
 	if (i < argc) {
 		A.cmd = argv[i++];
-		A.cmd_argv = (const char *const *)&argv[i];
-		A.cmd_argc = (size_t)(argc - i);
+		size_t start = (size_t)i;
+		size_t end = (size_t)argc;
+
+		while (end > start) {
+			const char *k = CB_NULL, *v = CB_NULL;
+			if (!is_env_assignment(argv[end - 1], &k, &v))
+				break;
+			
+			char keybuf[4096] = {0};
+			size_t klen = (size_t)(strchr(argv[end - 1], '=') - argv[end - 1]);
+			if (klen >= sizeof(keybuf)) {
+				klen = sizeof(keybuf) - 1;
+			}
+			memcpy(keybuf, k, klen);
+			keybuf[klen] = 0;
+			set_env_kv(keybuf, v);
+			end--;
+		}
+
+		A.cmd_argv = (const char *const *)&argv[start];
+		A.cmd_argc = end - start;
 	}
 	ctx->args = A;
 	g_ctx_singleton = ctx;
@@ -2165,14 +2184,12 @@ CB_API int cb_subrecipe_push(const char *dir) {
 	if (need_build) {
 		if (compile_carbidefile(dir, &cc, "Carbidefile.c", so_out) != 0) {
 			free(so_owned);
-			free(cc.path);
 			return -1;
 		}
 		write_stamp(dir, cc.path, cur_fp);
 	} else {
 		cb_log_internal("using cached Carbidefile (%s)", so_out);
 	}
-	free(cc.path);
 
 	handlers_swap_for_subrecipe();
 #if defined(_WIN32)
