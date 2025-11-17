@@ -1648,12 +1648,13 @@ static void free_handlers_list(handler_node *h) {
 	}
 }
 
-static const char *out_so_path(const char *dir) {
+static char *out_so_path(const char *carbide_dir, const char *fp) {
 	char *b = scratch();
-	const char *carbide_dir = cb_join(dir, ".carbide");
 	const char *bin = cb_join(carbide_dir, "Carbidefile");
-	snprintf(b, PATH_MAX, "%s%s", bin, shared_ext());
-	free((void *)carbide_dir);
+	if (fp && *fp)
+		snprintf(b, PATH_MAX, "%s-%s%s", bin, fp, shared_ext());
+	else
+		snprintf(b, PATH_MAX, "%s%s", bin, shared_ext());
 	free((void *)bin);
 	return sdup(b);
 }
@@ -1759,11 +1760,15 @@ CB_API void cb_shared_clear(void *ptr) {
 	}
 }
 
-static const char *stamp_path(const char *dir) {
-	const char *a = cb_join(dir, ".carbide");
-	const char *p = cb_join(a, "Carbidefile.stamp");
+static const char *stamp_path(const char *carbide_dir, const char *fp) {
+	const char *a = cb_join(carbide_dir, "Carbidefile");
+	char *b = scratch();
+	if (fp && *fp)
+		snprintf(b, PATH_MAX, "%s-%s.stamp", a, fp);
+	else
+		snprintf(b, PATH_MAX, "%s.stamp", a);
 	free((void *)a);
-	return p;
+	return sdup(b);
 }
 
 static uint64_t fnv1a64(const void *buf, size_t n, uint64_t seed) {
@@ -2036,16 +2041,14 @@ static void compute_fp(const char *src, const compiler_t *cc, char out[33]) {
 	snprintf(out, 33, "%s%s", a, b);
 }
 
-static void write_stamp(const char *dir, const char *cc_path, const char *fp) {
+static void write_stamp(const char *carbide_dir, const char *cc_path, const char *fp) {
 	char buf[1024];
 	snprintf(buf, sizeof(buf), "api=%d.%d.%d\ncc=%s\nfp=%s\n", CB_API_VERSION_MAJOR, CB_API_VERSION_MINOR,
 			 CB_API_VERSION_PATCH, cc_path ? cc_path : "", fp ? fp : "");
-	const char *sp = stamp_path(dir);
-	const char *carb = cb_join(dir, ".carbide");
-	cb_mkdir_p(carb);
+	const char *sp = stamp_path(carbide_dir, fp);
+	cb_mkdir_p(carbide_dir);
 	cb_write_text(sp, buf);
 	free((void *)sp);
-	free((void *)carb);
 }
 
 static void copy_line_value(char *dst, size_t dstsz, const char *src_after_eq) {
@@ -2060,9 +2063,10 @@ static void copy_line_value(char *dst, size_t dstsz, const char *src_after_eq) {
 	dst[len] = '\0';
 }
 
-static int read_stamp(const char *dir, int *apiM, int *apim, int *apip, char *cc_path_out, size_t cc_sz, char *fp_out,
+static int read_stamp(const char *carbide_dir, const char *fp, int *apiM, int *apim, int *apip, char *cc_path_out,
+					  size_t cc_sz, char *fp_out,
 					  size_t fp_sz) {
-	const char *sp = stamp_path(dir);
+	const char *sp = stamp_path(carbide_dir, fp);
 	FILE *f = fopen(sp, "r");
 	free((void *)sp);
 	if (!f)
@@ -2089,7 +2093,9 @@ static int compile_carbidefile(const char *dir, const compiler_t *cc, const char
 	if (!cb_file_exists(src)) {
 		dief("could not find recipe file (%s)", src);
 	}
-	cb_mkdir_p(cb_join(dir, ".carbide"));
+	char so_dir[PATH_MAX];
+	dirname_into(so_out, so_dir, sizeof(so_dir));
+	cb_mkdir_p(so_dir);
 
 	cb_cmd *cm = cb_cmd_new();
 #if defined(_WIN32)
@@ -2153,24 +2159,36 @@ CB_API int cb_subrecipe_push(const char *dir) {
 	if (!dir || !*dir)
 		return -1;
 
+	const char *parent_out = cb_ctx()->out_root;
 	compiler_t cc = discover_compiler();
 
-	const char *so_out = out_so_path(dir);
-	char *so_owned = sdup(so_out);
-
 	const char *src = cb_join(dir, "Carbidefile.c");
+	char cur_fp[33] = {0};
+	compute_fp(src, &cc, cur_fp);
+
+	char carbide_dir[PATH_MAX] = {0};
+	dirname_into(parent_out, carbide_dir, sizeof(carbide_dir));
+	if (!carbide_dir[0]) {
+		const char *fallback = cb_join(cb_ctx()->workspace_root, ".carbide");
+		strncpy(carbide_dir, fallback, sizeof(carbide_dir) - 1);
+		carbide_dir[sizeof(carbide_dir) - 1] = 0;
+		free((void *)fallback);
+	}
+
+	char *so_out = out_so_path(carbide_dir, cur_fp);
+	char *so_owned = so_out;
+
 	int need_build = 0;
 	int64_t m_src = file_mtime(src);
 	int64_t m_so = file_mtime(so_out);
 	if (m_so == 0 || m_src > m_so)
 		need_build = 1;
 
-	char cur_fp[33] = {0};
-	compute_fp(src, &cc, cur_fp);
 	int apiM = 0, apim = 0, apip = 0;
 	char prev_cc[PATH_MAX] = {0};
 	char prev_fp[64] = {0};
-	int have_stamp = read_stamp(dir, &apiM, &apim, &apip, prev_cc, sizeof(prev_cc), prev_fp, sizeof(prev_fp));
+	int have_stamp = read_stamp(carbide_dir, cur_fp, &apiM, &apim, &apip, prev_cc, sizeof(prev_cc), prev_fp,
+								sizeof(prev_fp));
 	if (!have_stamp) {
 		need_build = 1;
 	} else {
@@ -2182,11 +2200,12 @@ CB_API int cb_subrecipe_push(const char *dir) {
 			need_build = 1;
 	}
 	if (need_build) {
+		cb_mkdir_p(carbide_dir);
 		if (compile_carbidefile(dir, &cc, "Carbidefile.c", so_out) != 0) {
 			free(so_owned);
 			return -1;
 		}
-		write_stamp(dir, cc.path, cur_fp);
+		write_stamp(carbide_dir, cc.path, cur_fp);
 	} else {
 		cb_log_internal("using cached Carbidefile (%s)", so_out);
 	}
@@ -2198,10 +2217,7 @@ CB_API int cb_subrecipe_push(const char *dir) {
 	chdir(dir);
 #endif
 	cb_ctx()->workspace_root = sdup(cb_norm(dir));
-	const char *sub_out = cb_join(dir, ".carbide/out");
-	cb_mkdir_p(cb_join(dir, ".carbide"));
-	cb_mkdir_p(sub_out);
-	cb_ctx()->out_root = sdup(cb_norm(sub_out));
+	cb_ctx()->out_root = sdup(cb_norm(parent_out));
 	cb_register_cmd("help", builtin_help, "List available commands");
 
 	dylib_t lib = dylib_open(so_out);
@@ -2249,7 +2265,19 @@ int main(int argc, char **argv) {
 	compiler_t cc = discover_compiler();
 	cb_log_internal("using compiler: %s", cc.path);
 
-	char *so_path = sdup(out_so_path(cwd));
+	char cur_fp[33] = {0};
+	compute_fp(src, &cc, cur_fp);
+
+	char carbide_dir[PATH_MAX] = {0};
+	dirname_into(ctx->out_root, carbide_dir, sizeof(carbide_dir));
+	if (!carbide_dir[0]) {
+		const char *fallback = cb_join(cwd, ".carbide");
+		strncpy(carbide_dir, fallback, sizeof(carbide_dir) - 1);
+		carbide_dir[sizeof(carbide_dir) - 1] = 0;
+		free((void *)fallback);
+	}
+
+	char *so_path = out_so_path(carbide_dir, cur_fp);
 
 	int need_build = 0;
 	int64_t m_src = file_mtime(src);
@@ -2257,14 +2285,11 @@ int main(int argc, char **argv) {
 	if (m_so == 0 || m_src > m_so)
 		need_build = 1;
 
-	char cur_fp[33];
-	cur_fp[0] = 0;
-	compute_fp(src, &cc, cur_fp);
-
 	int apiM = 0, apim = 0, apip = 0;
 	char prev_cc[PATH_MAX] = {0};
 	char prev_fp[64] = {0};
-	int have_stamp = read_stamp(cwd, &apiM, &apim, &apip, prev_cc, sizeof(prev_cc), prev_fp, sizeof(prev_fp));
+	int have_stamp = read_stamp(carbide_dir, cur_fp, &apiM, &apim, &apip, prev_cc, sizeof(prev_cc), prev_fp,
+								sizeof(prev_fp));
 
 	if (!have_stamp)
 		need_build = 1;
@@ -2278,13 +2303,13 @@ int main(int argc, char **argv) {
 	}
 
 	if (need_build) {
-		cb_mkdir_p(".carbide");
+		cb_mkdir_p(carbide_dir);
 		if (compile_carbidefile(cwd, &cc, src, so_path) != 0) {
 			cb_finish(ctx);
 			free(so_path);
 			return 1;
 		}
-		write_stamp(cwd, cc.path, cur_fp);
+		write_stamp(carbide_dir, cc.path, cur_fp);
 	} else {
 		cb_log_internal("using cached Carbidefile (%s)", so_path);
 	}
